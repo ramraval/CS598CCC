@@ -443,7 +443,7 @@ class Simulator:
 
 if __name__ == "__main__":
   # Trinity
-  input_trace = pd.read_csv(os.path.abspath('../../Dataset/TrinityPredictionsRandomForestTest.csv'))
+  input_trace = pd.read_csv(os.path.abspath('../Dataset/TrinityPredictionsRandomForestTest.csv'))
   input_trace['time'] = pd.to_datetime(input_trace['time'])
 
   print("running Trinity LJW baseline")
