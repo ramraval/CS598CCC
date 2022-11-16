@@ -124,68 +124,6 @@ class Simulator:
       self._reserve_nodes.append(n)
 
   """
-  Reset the Simulator with new cluster config
-  """
-
-  def reset_cluster_config(self, NUM_VMS, VM_CPU) -> None:
-    # Constants
-    self.NUM_VMS = NUM_VMS
-    self.VM_CPU = VM_CPU
-
-    # Variables
-    self.next_jobID = 0
-    self.current_reserve_jobs = SortedList()
-    self.job_schedule_map = {}
-    self.wait_time_map = {}
-    self.wait_queue = deque()
-
-    # Cluster Information
-    self._reserve_nodes = []
-    vm_name = "m5.16xlarge"
-    for i in range(NUM_VMS):
-      n = Node(vm_name, i, VM_CPU)
-      self._reserve_nodes.append(n)
-
-  """
-  Reset the Simulator with new input trace
-  """
-
-  def reset_input_trace(self, input_trace) -> None:
-    self.input_trace = input_trace
-    self.job_count = input_trace.time.count()
-
-  """
-  Check for the finished jobs on reserved nodes, given the current time.
-  Add the back the resources to the respective nodes.
-  """
-
-  def _check_expired_jobs(self, current_time: datetime) -> None:
-    while self.current_reserve_jobs:
-      finish_time, job_id, node_id = self.current_reserve_jobs[0]
-      if finish_time <= current_time:
-        node = self._reserve_nodes[node_id]
-        # Remove the job from the node
-        node.remove_job(job_id)
-        # Pop the job from the running job list
-        self.current_reserve_jobs.pop(0)
-      else:
-        break
-
-  """
-  Best fit packing (criteria is based on CPU cores only)
-  """
-
-  def _best_fit_scheduling(self, cpu_req: int) -> Optional[Node]:
-    candidates: List[Node] = []
-    min_cpu, best_node = float("inf"), None
-    # Find all nodes that can schedule the job
-    for node in self._reserve_nodes:
-      if node.can_schedule(cpu_req) and node.idle_cpu < min_cpu:
-        best_node = node
-        min_cpu = node.idle_cpu
-    return best_node
-
-  """
   First fit packing
   """
 
@@ -248,7 +186,8 @@ class Simulator:
     return (total_cost, reserved_cost, on_demand_cost, normalized_price)
 
   """
-  Returns the next event
+  Method compares next job start time against current_reserve_job, and returns the job
+  with the lower timestamp.
   """
 
   def _get_next_event(self) -> Optional[Event]:
@@ -277,6 +216,7 @@ class Simulator:
     # Compare time events
     if next_dep_time <= next_arr_time:
       next_event = Event(etype.finish, next_dep_time, next_dep.job_id)
+
       # Add back the capacity
       _, _, node_id = self.current_reserve_jobs.pop(0)
       self._reserve_nodes[node_id].remove_job(next_dep.job_id)
@@ -300,7 +240,6 @@ class Simulator:
           ljw_strategy: LJWStrategy,
           max_wait_time_min: int,
           short_thresh_min: int,
-          cpd: bool = False,
           duration_hrs: int = None,
   ) -> tuple:
     # start time of simulation; for measuring the total simulation time
@@ -447,19 +386,30 @@ if __name__ == "__main__":
   input_trace['time'] = pd.to_datetime(input_trace['time'])
 
   print("running Trinity LJW baseline")
-  new_sim = Simulator(NUM_VMS=9408, VM_CPU=301056, input_trace=input_trace)
-  print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.BASELINE, max_wait_time_min=1440, short_thresh_min=3, cpd=True))
+  new_sim = Simulator(NUM_VMS=9408, VM_CPU=32, input_trace=input_trace)
+  print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.BASELINE, max_wait_time_min=1440, short_thresh_min=3))
 
   print("running Trinity LJW Random Forest Prediction")
-  new_sim = Simulator(NUM_VMS=9408, VM_CPU=301056, input_trace=input_trace)
-  print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.MLRUNTIMEMODEL, max_wait_time_min=1440, short_thresh_min=3, cpd=True))
+  new_sim = Simulator(NUM_VMS=9408, VM_CPU=32, input_trace=input_trace)
+  print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.MLRUNTIMEMODEL, max_wait_time_min=1440, short_thresh_min=3))
 
-"""
+  print("running Trinity LJW Speculative Execution")
+  new_sim = Simulator(NUM_VMS=9408, VM_CPU=32, input_trace=input_trace)
+  print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.SPECULATIVEEXECUTION, max_wait_time_min=1440, short_thresh_min=3))
+
   # Mustang
-  print("running Mustang LJW")
+  print("running Mustang LJW baseline")
+  input_trace = pd.read_csv(os.path.abspath('../Dataset/MustangPredictionsRandomForestTest.csv'))
   input_trace['time'] = pd.to_datetime(input_trace['time'])
-  input_trace = pd.read_csv(os.path.abspath('../../Dataset/MustangPredictionsRandomForestTest.csv'))
-  new_sim = Simulator(NUM_VMS=1600, VM_CPU=38400, input_trace=input_trace)
-  print(new_sim.run_LJW(max_wait_time_min=1440, short_thresh_min=3, cpd=True))
-"""
 
+  print("running Mustang LJW baseline")
+  new_sim = Simulator(NUM_VMS=1600, VM_CPU=24, input_trace=input_trace)
+  print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.BASELINE, max_wait_time_min=1440, short_thresh_min=3))
+
+  print("running Mustang LJW Random Forest Prediction")
+  new_sim = Simulator(NUM_VMS=1600, VM_CPU=24, input_trace=input_trace)
+  print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.MLRUNTIMEMODEL, max_wait_time_min=1440, short_thresh_min=3))
+
+  print("running Mustang LJW Speculative Execution")
+  new_sim = Simulator(NUM_VMS=1600, VM_CPU=24, input_trace=input_trace)
+  print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.SPECULATIVEEXECUTION, max_wait_time_min=1440, short_thresh_min=3))
