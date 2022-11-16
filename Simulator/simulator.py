@@ -398,7 +398,6 @@ if __name__ == "__main__":
   print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.SPECULATIVEEXECUTION, max_wait_time_min=1440, short_thresh_min=3))
 
   # Mustang
-  print("running Mustang LJW baseline")
   input_trace = pd.read_csv(os.path.abspath('../Dataset/MustangPredictionsRandomForestTest.csv'))
   input_trace['time'] = pd.to_datetime(input_trace['time'])
 
