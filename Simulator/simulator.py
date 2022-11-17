@@ -49,11 +49,9 @@ def compute_perfect_fit(b1: int, b2: int, df: pd.DataFrame) -> float:
   type df: dataframe
   """
 
-  # Todo: Figure out what to do here
-  #filtered_df = df[(df["cpu_dominant"] > b1) & (df["cpu_dominant"] <= b2)]
-  #bounded_job_rt = filtered_df.wallclock_runtime_sec.sum() / 3600
+  filtered_df = df[(df["num_cores"] > b1) & (df["num_cores"] <= b2)]
+  bounded_job_rt = filtered_df.wallclock_runtime_sec.sum() / 3600
 
-  bounded_job_rt = df.wallclock_runtime_sec.sum() / 3600
   return b2 * bounded_job_rt * 0.048
 
 
@@ -91,7 +89,7 @@ input_trace: Dataframe; Input trace as pandas data frame
 next_jobID: int; jobID of next job arrival
 current_reserve_jobs: SortedList(tuple); tuple - (finishtime, jobID, nodeID)
 job_schedule_map: Dictionary; key - jobID, value - 'R' or 'D'
-wait_time_map: Dicitionary; key - jobID, value - int
+wait_time_map: Dictionary; key - jobID, value - int
 wait_queue: deque; waiting queue
 """
 
@@ -245,15 +243,23 @@ class Simulator:
     # start time of simulation; for measuring the total simulation time
     t_start = time.time()
 
-    # bookkeeping
-    reserve_cpu_time = 0
-    on_demand_count = 0
+    # In Speculative execution, we always run on on-demand first.
+    # We want to shift the time by the short_thresh_min as that is the time when we will try to run it in on-prem.
+    if ljw_strategy == Simulator.LJWStrategy.SPECULATIVEEXECUTION:
+      self.input_trace['time'] = self.input_trace.apply(lambda row: row['time'] if row['wallclock_runtime_sec'] < short_thresh_min * 60 else row['time'] + pd.to_timedelta(short_thresh_min, unit='m'), axis=1)
+
+    # Ordering dataset by time since thats the order it comes in
+    self.input_trace = self.input_trace.sort_values(by=['time'])
 
     # Next event for the simulator
     next_event = self._get_next_event()
 
     # For computing cost
     start = end = self.input_trace.iloc[0].time
+
+    # we will need to pay for unfinished job on demand in cloud
+    # @Ram, modify this to contain information that can be used to estimate cost of On Demand Resources.
+    on_demand_discarded_job = pd.DataFrame(columns=["num_cores", "wallclock_runtime_sec"])
 
     while next_event:
       if next_event.etype == etype.schedule:
@@ -263,20 +269,21 @@ class Simulator:
 
         # Job requirements
         cpu_req = cur_job.num_cores
-        runtime_sec = cur_job.wallclock_runtime_sec if ljw_strategy == Simulator.LJWStrategy.BASELINE else cur_job.predicted_time
+
+        runtime_sec = cur_job.predicted_time if ljw_strategy == Simulator.LJWStrategy.MLRUNTIMEMODEL else cur_job.wallclock_runtime_sec
 
         if runtime_sec <= short_thresh_min * 60:
           # Run the job on on-demand -- Short job
-          on_demand_count += 1
           self.job_schedule_map[cur_job.job_id] = "D"
         elif (not self.wait_queue) and self._schedule_job(
                 cur_time, cpu_req, runtime_sec, next_event.job_id
         ):
-          # Book keeping
-          reserve_cpu_time += cpu_req * runtime_sec
+          # if its speculative exeuction, we need to run the same job on demand for short thresh min
+          if ljw_strategy == Simulator.LJWStrategy.SPECULATIVEEXECUTION:
+            on_demand_discarded_job.loc[len(on_demand_discarded_job)] = [cur_job.num_cores, short_thresh_min]
           end = max(end, cur_time + timedelta(seconds=int(runtime_sec)))
         else:
-          # Add job to wait queue
+          # If Job is long, and we cannot schedule, then wait
           self.wait_queue.append(cur_job.job_id)
       else:
         # A job is finished. So, check the wait queue
@@ -296,7 +303,6 @@ class Simulator:
             self.wait_queue.popleft()
             self.wait_time_map[job_id] = max_wait_time_sec
             self.job_schedule_map[job_id] = "D"
-            on_demand_count += 1
 
             end = max(
               end, next_event.time + timedelta(seconds=int(runtime_sec))
@@ -308,9 +314,6 @@ class Simulator:
             if self._schedule_job(
                     next_event.time, cpu_req, runtime_sec, job_id
             ):
-              # Book keeping
-              reserve_cpu_time += cpu_req * runtime_sec
-
               # remove the job from the queue
               self.wait_queue.popleft()
 
@@ -368,6 +371,7 @@ class Simulator:
       on_demand_cost,
       effective_price,
     ) = self._compute_total_cost(self.input_trace, duration_hrs)
+
     print(
       "Reserved cost is ",
       reserved_cost,
@@ -383,18 +387,18 @@ class Simulator:
 if __name__ == "__main__":
   # Trinity
   input_trace = pd.read_csv(os.path.abspath('../Dataset/TrinityPredictionsRandomForestTest.csv'))
-  input_trace['time'] = pd.to_datetime(input_trace['time'])
+  input_trace['time'] = pd.to_datetime(input_trace['time'], utc=True)
 
   print("running Trinity LJW baseline")
-  new_sim = Simulator(NUM_VMS=9408, VM_CPU=32, input_trace=input_trace)
+  new_sim = Simulator(NUM_VMS=150, VM_CPU=64, input_trace=input_trace)
   print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.BASELINE, max_wait_time_min=1440, short_thresh_min=3))
 
   print("running Trinity LJW Random Forest Prediction")
-  new_sim = Simulator(NUM_VMS=9408, VM_CPU=32, input_trace=input_trace)
+  new_sim = Simulator(NUM_VMS=150, VM_CPU=64, input_trace=input_trace)
   print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.MLRUNTIMEMODEL, max_wait_time_min=1440, short_thresh_min=3))
 
   print("running Trinity LJW Speculative Execution")
-  new_sim = Simulator(NUM_VMS=9408, VM_CPU=32, input_trace=input_trace)
+  new_sim = Simulator(NUM_VMS=150, VM_CPU=64, input_trace=input_trace)
   print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.SPECULATIVEEXECUTION, max_wait_time_min=1440, short_thresh_min=3))
 
   # Mustang
@@ -402,13 +406,13 @@ if __name__ == "__main__":
   input_trace['time'] = pd.to_datetime(input_trace['time'])
 
   print("running Mustang LJW baseline")
-  new_sim = Simulator(NUM_VMS=1600, VM_CPU=24, input_trace=input_trace)
+  new_sim = Simulator(NUM_VMS=150, VM_CPU=64, input_trace=input_trace)
   print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.BASELINE, max_wait_time_min=1440, short_thresh_min=3))
 
   print("running Mustang LJW Random Forest Prediction")
-  new_sim = Simulator(NUM_VMS=1600, VM_CPU=24, input_trace=input_trace)
+  new_sim = Simulator(NUM_VMS=150, VM_CPU=64, input_trace=input_trace)
   print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.MLRUNTIMEMODEL, max_wait_time_min=1440, short_thresh_min=3))
 
   print("running Mustang LJW Speculative Execution")
-  new_sim = Simulator(NUM_VMS=1600, VM_CPU=24, input_trace=input_trace)
+  new_sim = Simulator(NUM_VMS=150, VM_CPU=64, input_trace=input_trace)
   print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.SPECULATIVEEXECUTION, max_wait_time_min=1440, short_thresh_min=3))
