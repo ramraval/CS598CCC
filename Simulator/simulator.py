@@ -49,11 +49,11 @@ def compute_perfect_fit(b1: int, b2: int, df: pd.DataFrame) -> float:
   type df: dataframe
   """
 
-  # Todo: Figure out what to do here
-  #filtered_df = df[(df["cpu_dominant"] > b1) & (df["cpu_dominant"] <= b2)]
-  #bounded_job_rt = filtered_df.wallclock_runtime_sec.sum() / 3600
+  # @Ram, is this the right thing to do here we dont have the number of CPUs required here
+  # So I assume they just want 1 core per node.
+  filtered_df = df[(df["num_cores"] > b1) & (df["num_cores"] <= b2)]
+  bounded_job_rt = filtered_df.wallclock_runtime_sec.sum() / 3600
 
-  bounded_job_rt = df.wallclock_runtime_sec.sum() / 3600
   return b2 * bounded_job_rt * 0.048
 
 
@@ -386,15 +386,15 @@ if __name__ == "__main__":
   input_trace['time'] = pd.to_datetime(input_trace['time'])
 
   print("running Trinity LJW baseline")
-  new_sim = Simulator(NUM_VMS=9408, VM_CPU=32, input_trace=input_trace)
+  new_sim = Simulator(NUM_VMS=150, VM_CPU=64, input_trace=input_trace)
   print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.BASELINE, max_wait_time_min=1440, short_thresh_min=3))
 
   print("running Trinity LJW Random Forest Prediction")
-  new_sim = Simulator(NUM_VMS=9408, VM_CPU=32, input_trace=input_trace)
+  new_sim = Simulator(NUM_VMS=150, VM_CPU=64, input_trace=input_trace)
   print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.MLRUNTIMEMODEL, max_wait_time_min=1440, short_thresh_min=3))
 
   print("running Trinity LJW Speculative Execution")
-  new_sim = Simulator(NUM_VMS=9408, VM_CPU=32, input_trace=input_trace)
+  new_sim = Simulator(NUM_VMS=150, VM_CPU=64, input_trace=input_trace)
   print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.SPECULATIVEEXECUTION, max_wait_time_min=1440, short_thresh_min=3))
 
   # Mustang
@@ -402,13 +402,13 @@ if __name__ == "__main__":
   input_trace['time'] = pd.to_datetime(input_trace['time'])
 
   print("running Mustang LJW baseline")
-  new_sim = Simulator(NUM_VMS=1600, VM_CPU=24, input_trace=input_trace)
+  new_sim = Simulator(NUM_VMS=150, VM_CPU=64, input_trace=input_trace)
   print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.BASELINE, max_wait_time_min=1440, short_thresh_min=3))
 
   print("running Mustang LJW Random Forest Prediction")
-  new_sim = Simulator(NUM_VMS=1600, VM_CPU=24, input_trace=input_trace)
+  new_sim = Simulator(NUM_VMS=150, VM_CPU=64, input_trace=input_trace)
   print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.MLRUNTIMEMODEL, max_wait_time_min=1440, short_thresh_min=3))
 
   print("running Mustang LJW Speculative Execution")
-  new_sim = Simulator(NUM_VMS=1600, VM_CPU=24, input_trace=input_trace)
+  new_sim = Simulator(NUM_VMS=150, VM_CPU=64, input_trace=input_trace)
   print(new_sim.run_LJW(ljw_strategy=Simulator.LJWStrategy.SPECULATIVEEXECUTION, max_wait_time_min=1440, short_thresh_min=3))
