@@ -54,6 +54,44 @@ class Event:
         self.job_id = job_id
 
 
+"""
+Class definition for waiting time model used to dynamically predict waiting time for submitted jobs
+"""
+
+class WaitingTimeModel:
+    def __init__(self, training_trace: str, waiting_time_threshold_sec: int, dataset: str):
+        self.training_trace = training_trace
+        self.waiting_time_threshold_sec = waiting_time_threshold_sec
+        self.dataset = dataset
+
+    """
+    Train waiting time model on training trace given specified waiting time threshold; return model fit on training data
+    """
+
+    def train_waiting_time_model(self):
+        self.training_trace['should_wait_waiting_time_actual'] = self.training_trace['wait_time'] < self.waiting_time_threshold_sec
+
+        X = self.training_trace[['user_id', 'submit_time', 'requested_time', 'requested_CPUs',
+                'num_running_jobs', 'num_waiting_jobs',
+                'running_job_requested_CPUs', 'running_job_requested_CPU_time', 'running_job_mean_CPUs',
+                'running_job_mean_CPU_time', 'running_job_requested_wallclock_limit',
+                'running_job_mean_wallclock_limit',
+                'waiting_job_requested_CPUs', 'waiting_job_requested_CPU_time', 'waiting_job_mean_CPUs',
+                'waiting_job_mean_CPU_time', 'waiting_job_requested_wallclock_limit',
+                'waiting_job_mean_wallclock_limit',
+                'elapsed_runtime_total', 'elapsed_runtime_mean', 'elapsed_waiting_time_total',
+                'elapsed_waiting_time_mean']]
+        y = self.training_trace['should_wait_waiting_time_actual']
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=TEST_SIZE, shuffle=False)
+
+        if self.dataset == 'ANL':
+            clf = GradientBoostingClassifier(n_estimators=100, random_state=0)
+        else:
+            clf = RandomForestClassifier(n_estimators=100, random_state=0)
+
+        clf.fit(X_train, y_train.values.ravel())
+        return clf
+
 ## Helper functions
 
 def division_helper(numerator: int, denominator: int) -> float:
@@ -124,36 +162,15 @@ class Simulator:
     Otherwise, return dict indicating how many CPUs to reserve on which nodes 
     """
 
-    def _first_fit_scheduling(self, cpu_req: int) -> Optional[dict]:
-        counter = 0
+    def _can_schedule(self, cpu_req: int) -> Optional[dict]:
         node_dic = {}
-
-        # jobs need to be scheduled across multiple nodes
-        while cpu_req and counter < len(self._reserve_nodes):
-            node = self._reserve_nodes[counter]
+        for node in self._reserve_nodes:
             cpus_scheduled = min(cpu_req, node.idle_cpu)
             if cpus_scheduled:
                 node_dic[node._nodeID] = cpus_scheduled
-            cpu_req -= cpus_scheduled
-            counter += 1
+                cpu_req -= cpus_scheduled
 
-        if cpu_req == 0:
-            return node_dic
-        else:
-            return None
-
-    """
-    Determines whether sufficient fixed resources are currently available to run job
-    """
-    def _can_schedule(
-            self,
-            cpu_req: int
-    ) -> bool:
-        node_dic = self._first_fit_scheduling(cpu_req)
-        if node_dic:
-            return True
-        else:
-            return False
+        return node_dic if cpu_req == 0 else None
 
     """
     Reserve specified CPUs on specified nodes for a given job
@@ -162,16 +179,15 @@ class Simulator:
 
     def _schedule(
             self,
+            schedule_dict: dict,
             start_time: int,
-            cpu_req: int,
             runtime_sec: int,
             job_id: int,
     ) -> None:
-        node_dic = self._first_fit_scheduling(cpu_req)
-        for node_id, CPU_count in node_dic.items():
+        for node_id, CPU_count in schedule_dict.items():
             self._reserve_nodes[node_id].schedule_job(CPU_count, job_id)
         finish_time = start_time + runtime_sec
-        self.current_reserve_jobs.add((finish_time, start_time, job_id, node_dic.keys()))
+        self.current_reserve_jobs.add((finish_time, start_time, job_id, schedule_dict.keys()))
 
     """
     Returns the next event
@@ -220,9 +236,9 @@ class Simulator:
     def set_waiting_time(self, job, waiting_time):
         self.wait_time_map[job.job_id] = waiting_time
 
-    def calc_waiting_time_and_reserved_cost(self):
-        self.input_trace["wait_time_sec"] = (self.input_trace["job_id"].map(self.wait_time_map))
-        self.mean_waiting_time, self.reserved_cost = self.input_trace.wait_time_sec.mean(), self._compute_fixed_cost()
+    def calc_on_demand_cost_for_job(self, job, runtime):
+        CPUs_needed = self.VM_CPU * math.ceil(job.allocated_CPUs / self.VM_CPU)
+        return CPUs_needed * (runtime / SECONDS_IN_HOUR) * UNIT_CPU_COST_HR
 
     """
     Calculates approximate cost of running fixed cluster for trace duration
@@ -235,6 +251,10 @@ class Simulator:
         end_time = self.input_trace.loc[self.input_trace['end_time'].idxmax()].end_time
         hours_in_operation = (end_time - start_time) / SECONDS_IN_HOUR
         return hours_in_operation * UNIT_CPU_COST_HR * self.NUM_VMS * self.VM_CPU * (1 - RESERVE_DISCOUNT)
+
+    def calc_waiting_time_and_reserved_cost(self):
+        self.input_trace["wait_time_sec"] = (self.input_trace["job_id"].map(self.wait_time_map))
+        self.mean_waiting_time, self.reserved_cost = self.input_trace.wait_time_sec.mean(), self._compute_fixed_cost()
 
     """
     Check for finished jobs on reserved nodes given current time.
@@ -251,11 +271,11 @@ class Simulator:
                 # Pop the job from the running job list
                 self.current_reserve_jobs.pop(0)
             else:
-                break
+                return
 
 
     def resubmit_long_jobs_after_spec_execution(self, job, runtime_threshold_sec):
-        # Resubmit job after running for "t" time per speculative execution
+        # Resubmit job after running for "runtime_threshold_sec" time per speculative execution
         job.loc['speculative_execution'] = True
         job.loc['submit_time'] = job['submit_time'] + runtime_threshold_sec
 
@@ -271,10 +291,6 @@ class Simulator:
                                       self.input_trace.iloc[new_index:]]).reset_index(drop=True)
         self.input_trace['job_id'] = self.input_trace.index
 
-    def calc_on_demand_cost_for_job(self, job, runtime):
-        CPUs_needed = self.VM_CPU * math.ceil(job.allocated_CPUs / self.VM_CPU)
-        return CPUs_needed * (runtime / SECONDS_IN_HOUR) * UNIT_CPU_COST_HR
-
     def print_results(self) -> None:
         print(
             "Reserved cost is ",
@@ -286,35 +302,6 @@ class Simulator:
             ", Mean waiting time is ",
             self.mean_waiting_time / 60, " minutes"
         )
-
-    """
-    Train waiting time model on training trace given specified waiting time threshold; return model fit on training data
-    """
-
-    def train_waiting_time_model(self, waiting_time_threshold_sec: int):
-        df = self.training_trace
-        df['should_wait_waiting_time_actual'] = df['wait_time'] < waiting_time_threshold_sec
-
-        X = df[['user_id', 'submit_time', 'requested_time', 'requested_CPUs',
-                'num_running_jobs', 'num_waiting_jobs',
-                'running_job_requested_CPUs', 'running_job_requested_CPU_time', 'running_job_mean_CPUs',
-                'running_job_mean_CPU_time', 'running_job_requested_wallclock_limit',
-                'running_job_mean_wallclock_limit',
-                'waiting_job_requested_CPUs', 'waiting_job_requested_CPU_time', 'waiting_job_mean_CPUs',
-                'waiting_job_mean_CPU_time', 'waiting_job_requested_wallclock_limit',
-                'waiting_job_mean_wallclock_limit',
-                'elapsed_runtime_total', 'elapsed_runtime_mean', 'elapsed_waiting_time_total',
-                'elapsed_waiting_time_mean']]
-        y = df['should_wait_waiting_time_actual']
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=TEST_SIZE, shuffle=False)
-
-        if self.dataset == 'ANL':
-            clf = GradientBoostingClassifier(n_estimators=100, random_state=0)
-        else:
-            clf = RandomForestClassifier(n_estimators=100, random_state=0)
-
-        clf.fit(X_train, y_train.values.ravel())
-        return clf
 
     """
     Calculate system state upon submission of a job in order to predict waiting time
@@ -389,6 +376,15 @@ class Simulator:
                                              'elapsed_waiting_time_mean'])
         return X_test
 
+    """
+        Run the simulator using our custom approach
+        *Implements LJW using ML models and a modified form of speculative execution 
+        *Implements SWW based on waiting time models
+        *First, jobs run on fixed resources if sufficient resources are available
+        *Next, any jobs that are predicted to be both long and have a short wait are made to wait for fixed resources
+        *All other jobs run on on-demand resources for up to "runtime threshold_min" time. Jobs that are still running
+        after this time are killed and resubmitted to queue for fixed resources
+    """
     def run_custom_approach(
             self,
             runtime_threshold_min: int,
@@ -399,7 +395,7 @@ class Simulator:
         self.input_trace['speculative_execution'] = False
 
         next_event = self._get_next_event()
-        model = self.train_waiting_time_model(max_wait_time_sec)
+        model = WaitingTimeModel(self.training_trace, max_wait_time_sec, self.dataset).train_waiting_time_model()
         total_on_demand_cost = 0
 
         run_immediately = 0
@@ -414,10 +410,11 @@ class Simulator:
 
                 cur_job = self.input_trace.loc[self.input_trace['job_id'] == next_event.job_id].iloc[0]
                 cur_job_id, cur_time, cpu_alloc, runtime = get_job_attributes(cur_job)
+                is_schedulable = self._can_schedule(cpu_alloc)
 
-                if self.queue_is_empty() and self._can_schedule(cpu_alloc):
+                if self.queue_is_empty() and is_schedulable:
                     # Run the job on fixed resources - no queue & sufficient resources available
-                    self._schedule(cur_time, cpu_alloc, runtime, cur_job_id)
+                    self._schedule(is_schedulable, cur_time, runtime, cur_job_id)
                     self.set_waiting_time(cur_job, 0)
                     run_immediately += 1
                 elif is_long_job(cur_job, runtime_threshold_min) and self.is_short_wait(model, cur_job):
@@ -446,11 +443,12 @@ class Simulator:
                         get_job_attributes(waiting_job)
                     time_waited_sec = next_event.time - waiting_job_time + \
                                       (waiting_job.speculative_execution * runtime_threshold_sec)
+                    is_waiting_job_schedulable = self._can_schedule(waiting_job_cpu_alloc)
 
                     # Try scheduling the job
-                    if self._can_schedule(waiting_job_cpu_alloc):
+                    if is_waiting_job_schedulable:
                         self.wait_queue.popleft()
-                        self._schedule(next_event.time, waiting_job_cpu_alloc, waiting_job_runtime, waiting_job_id)
+                        self._schedule(is_waiting_job_schedulable, next_event.time, waiting_job_runtime, waiting_job_id)
                         self.set_waiting_time(waiting_job, time_waited_sec)
                         waited_in_queue += 1
                     else:
@@ -466,90 +464,17 @@ class Simulator:
         print("Waited in queue: " + str(waited_in_queue))
         print("Waited max time: " + str(waited_max_time))
 
-    def run_custom_approach_with_waiting_time_limit(
-            self,
-            runtime_threshold_min: int,
-            waiting_time_threshold_hour: int,
-    ) -> None:
-        max_wait_time_sec = waiting_time_threshold_hour * SECONDS_IN_HOUR
-        runtime_threshold_sec = runtime_threshold_min * 60
-        self.input_trace['speculative_execution'] = False
+    """
+    Run the simulator using original approach vs. which we are benchmarking our custom approach
+    *Implements LJW using speculative execution - if sufficient fixed resources are unavailable, all jobs run on 
+        on-demand resources for up to "runtime_threshold_min" time before being killed and restarted on fixed resources
+        if wait time is predicted to be under "waiting_time_threshold_hour"
+    *Implements SWW based on waiting time models - uses ML model to predict whether wait time is under 
+        "waiting_time_threshold_hour". Additionally, any jobs that have been waiting longer than this time run on 
+        on-demand resources to prevent excessive waits
+    """
 
-        next_event = self._get_next_event()
-        model = self.train_waiting_time_model(max_wait_time_sec)
-        total_on_demand_cost = 0
-
-        run_immediately = 0
-        run_spec_exec_correct = 0
-        run_spec_exec_incorrect = 0
-        waited_in_queue = 0
-        waited_max_time = 0
-
-        while next_event:
-            if next_event.etype == etype.schedule:
-                # Schedule new job
-
-                cur_job = self.input_trace.loc[self.input_trace['job_id'] == next_event.job_id].iloc[0]
-                cur_job_id, cur_time, cpu_alloc, runtime = get_job_attributes(cur_job)
-
-                if self.queue_is_empty() and self._can_schedule(cpu_alloc):
-                    # Run the job on fixed resources - no queue & sufficient resources available
-                    self._schedule(cur_time, cpu_alloc, runtime, cur_job_id)
-                    self.set_waiting_time(cur_job, 0)
-                    run_immediately += 1
-                elif is_long_job(cur_job, runtime_threshold_min) and self.is_short_wait(model, cur_job):
-                    # Jobs should wait for fixed resources if they are 1) long or 2) have short waits
-                    self.wait_queue.append(cur_job.job_id)
-                elif cur_job.speculative_execution:
-                    self.wait_queue.append(cur_job.job_id)
-                else:
-                    # Run the job on on-demand -- short job or long wait
-                    spec_exec_runtime = min(runtime_threshold_sec, runtime)
-                    total_on_demand_cost += self.calc_on_demand_cost_for_job(cur_job, spec_exec_runtime)
-                    if runtime <= runtime_threshold_sec:
-                        self.set_waiting_time(cur_job, 0)
-                        run_spec_exec_correct += 1
-                    else:
-                        self.resubmit_long_jobs_after_spec_execution(cur_job, runtime_threshold_sec)
-                        run_spec_exec_incorrect += 1
-
-            else:
-                # A job is finished. So, check the wait queue
-                while len(self.wait_queue) > 0:
-                    waiting_job = self.input_trace.loc[self.input_trace['job_id'] == self.wait_queue[0]].iloc[0]
-                    waiting_job_id, waiting_job_time, waiting_job_cpu_alloc, waiting_job_runtime = \
-                        get_job_attributes(waiting_job)
-                    time_waited_sec = next_event.time - waiting_job_time + \
-                                      (waiting_job.speculative_execution * runtime_threshold_sec)
-
-                    # Check if job waited more than the max waiting time
-                    if time_waited_sec > (max_wait_time_sec):
-                        # Remove the job from the queue
-                        self.wait_queue.popleft()
-                        total_on_demand_cost += self.calc_on_demand_cost_for_job(waiting_job, waiting_job_runtime)
-                        self.set_waiting_time(waiting_job, max_wait_time_sec)
-                        waited_max_time += 1
-                    else:
-                        # Try scheduling the job
-                        if self._can_schedule(waiting_job_cpu_alloc):
-                            self.wait_queue.popleft()
-                            self._schedule(next_event.time, waiting_job_cpu_alloc, waiting_job_runtime, waiting_job_id)
-                            self.set_waiting_time(waiting_job, time_waited_sec)
-                            waited_in_queue += 1
-                        else:
-                            break
-            next_event = self._get_next_event()
-
-        self.calc_waiting_time_and_reserved_cost()
-        self.on_demand_cost = total_on_demand_cost
-        self.print_results()
-        print("Run immediately: " + str(run_immediately))
-        print("Run spec_exec correct: " + str(run_spec_exec_correct))
-        print("Run spec_exec incorrect: " + str(run_spec_exec_incorrect))
-        print("Waited in queue: " + str(waited_in_queue))
-        print("Waited max time: " + str(waited_max_time))
-
-    def run_Ambati(
+    def run_original(
             self,
             runtime_threshold_min: int,
             waiting_time_threshold_hour: int,
@@ -561,7 +486,7 @@ class Simulator:
         total_on_demand_cost = 0
 
         next_event = self._get_next_event()
-        model = self.train_waiting_time_model(max_wait_time_sec)
+        model = WaitingTimeModel(self.training_trace, max_wait_time_sec, self.dataset).train_waiting_time_model()
         run_immediately = 0
         run_spec_exec_correct = 0
         run_on_demand_incorrect = 0
@@ -578,11 +503,12 @@ class Simulator:
                 num_jobs += 1
                 cur_job = self.input_trace.loc[self.input_trace['job_id'] == next_event.job_id].iloc[0]
                 cur_job_id, cur_time, cpu_alloc, runtime = get_job_attributes(cur_job)
+                is_schedulable = self._can_schedule(cpu_alloc)
 
-                if self.queue_is_empty() and self._can_schedule(cpu_alloc):
+                if self.queue_is_empty() and is_schedulable:
                     # Run the job on fixed resources - no queue & sufficient resources available
                     self.set_waiting_time(cur_job, 0)
-                    self._schedule(cur_time, cpu_alloc, runtime, cur_job_id)
+                    self._schedule(is_schedulable, cur_time, runtime, cur_job_id)
                     fixed += 1
                     run_immediately += 1
                 elif cur_job.speculative_execution:
@@ -613,6 +539,7 @@ class Simulator:
                         get_job_attributes(waiting_job)
                     time_waited_sec = next_event.time - waiting_job_time + \
                                       (waiting_job.speculative_execution * runtime_threshold_sec)
+                    is_waiting_job_schedulable = self._can_schedule(waiting_job_cpu_alloc)
 
                     # Check if job waited more than the max waiting time
                     if time_waited_sec > (max_wait_time_sec):
@@ -624,9 +551,10 @@ class Simulator:
                         on_demand += 1
                     else:
                         # Try scheduling the job
-                        if self._can_schedule(waiting_job_cpu_alloc):
+                        if is_waiting_job_schedulable:
                             self.wait_queue.popleft()
-                            self._schedule(next_event.time, waiting_job_cpu_alloc, waiting_job_runtime, waiting_job_id)
+                            self._schedule(is_waiting_job_schedulable, next_event.time,
+                                           waiting_job_runtime, waiting_job_id)
                             self.set_waiting_time(waiting_job, time_waited_sec)
                             waited_in_queue += 1
                             fixed += 1
@@ -659,13 +587,14 @@ class Simulator:
             # New job request
             cur_job = self.input_trace.loc[self.input_trace['job_id'] == self.next_jobID].iloc[0]
             cur_job_id, cur_time, cpu_alloc, runtime = get_job_attributes(cur_job)
+            is_schedulable = self._can_schedule(cpu_alloc)
 
             if cur_time != prev_time:
                 self._check_expired_jobs(cur_time)
 
-            if self._can_schedule(cpu_alloc):
+            if is_schedulable:
                 # Run the job on fixed resources - no wait queue
-                self._schedule(cur_time, cpu_alloc, runtime, cur_job_id)
+                self._schedule(is_schedulable, cur_time, runtime, cur_job_id)
                 self.set_waiting_time(cur_job, 0)
             else:
                 # Job should run on on-demand resources instead of waiting
@@ -694,10 +623,11 @@ class Simulator:
                 cur_job = self.input_trace.loc[self.input_trace['job_id'] == next_event.job_id].iloc[0]
 
                 cur_job_id, cur_time, cpu_alloc, runtime = get_job_attributes(cur_job)
+                is_schedulable = self._can_schedule(cpu_alloc)
 
-                if self.queue_is_empty() and self._can_schedule(cpu_alloc):
+                if self.queue_is_empty() and is_schedulable:
                     # Run the job on fixed resources - no wait queue
-                    self._schedule(cur_time, cpu_alloc, runtime, cur_job_id)
+                    self._schedule(is_schedulable, cur_time, runtime, cur_job_id)
                     self.set_waiting_time(cur_job, 0)
                 else:
                     # Job should run on fixed resources, but it must wait
@@ -711,9 +641,10 @@ class Simulator:
                         get_job_attributes(waiting_job)
 
                     time_waited_sec = next_event.time - waiting_job_time
+                    is_waiting_job_schedulable = self._can_schedule(waiting_job_cpu_alloc)
 
-                    if self._can_schedule(waiting_job_cpu_alloc):
-                        self._schedule(next_event.time, waiting_job_cpu_alloc, waiting_job_runtime, waiting_job_id)
+                    if is_waiting_job_schedulable:
+                        self._schedule(is_waiting_job_schedulable, next_event.time, waiting_job_runtime, waiting_job_id)
                         self.wait_queue.popleft()
                         self.set_waiting_time(waiting_job, time_waited_sec)
 
@@ -733,10 +664,10 @@ def get_results_custom_approach(simulator, dataset, runtime_threshold, waiting_t
                                   waiting_time_threshold_hour=waiting_time_threshold)
 
 
-def get_results_Ambati(simulator, dataset, runtime_threshold, waiting_time_threshold) -> None:
-    print("Running Ambati et al. approach on " + dataset + " with runtime threshold of " + str(runtime_threshold) +
+def get_results_original(simulator, dataset, runtime_threshold, waiting_time_threshold) -> None:
+    print("Running original approach on " + dataset + " with runtime threshold of " + str(runtime_threshold) +
           " minutes and waiting time threshold of " + str(waiting_time_threshold) + " hour(s)")
-    simulator.run_Ambati(runtime_threshold_min=runtime_threshold, waiting_time_threshold_hour=waiting_time_threshold)
+    simulator.run_original(runtime_threshold_min=runtime_threshold, waiting_time_threshold_hour=waiting_time_threshold)
 
 def get_results_NJW(simulator, dataset) -> None:
     print("Running NJW on " + dataset)
@@ -768,4 +699,4 @@ if __name__ == "__main__":
         for waiting_time_threshold in WAITING_TIME_THRESHOLD_VALUES:
            simulator = Simulator(dataset=dataset, NUM_VMS=num_VMs, VM_CPU=vm_CPU, input_trace=input_trace,
                                   training_trace=training_trace)
-           get_results_Ambati(simulator, dataset, runtime_threshold, waiting_time_threshold)
+           get_results_original(simulator, dataset, runtime_threshold, waiting_time_threshold)
