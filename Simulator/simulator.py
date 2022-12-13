@@ -8,112 +8,24 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 import math
-import os
-import sys
 import numpy as np
 import pandas as pd
 
 from collections import deque
-from enum import Enum
 from typing import Dict, List, Optional
 from sortedcontainers import SortedList
-from node import Node
-from sklearn.ensemble import GradientBoostingClassifier
-from sklearn.model_selection import train_test_split
+from Node import Node
 
-import warnings
-warnings.simplefilter(action='ignore', category=FutureWarning)
+from Event import Event
+from WaitingTimeModel import WaitingTimeModel
+from etype import etype
 
 UNIT_CPU_COST_HR = 0.048  # Cost Estimation assuming m5 family
 RESERVE_DISCOUNT = 0.6  # 3 year discount
 SECONDS_IN_MINUTE = 60
 SECONDS_IN_HOUR = 3600
-TEST_SIZE = 0.1
 RUNTIME_THRESHOLD_VALUES = [5, 15, 60]
 WAITING_TIME_THRESHOLD_VALUES = [6]
-
-"""
-Class definition for event type enum
-"""
-
-
-class etype(Enum):
-    schedule = 1
-    finish = 2
-
-
-"""
-Class definition for event;
-Event type can be "Start" indicated by 1 or "Expire" indicated by 2
-"""
-
-
-class Event:
-    def __init__(self, etype: etype, time: int, job_id: int):
-        self.etype = etype
-        self.time = time
-        self.job_id = job_id
-
-
-"""
-Class definition for waiting time model used to dynamically predict waiting time for submitted jobs
-"""
-
-class WaitingTimeModel:
-    def __init__(self, training_trace: str, waiting_time_threshold_sec: int, dataset: str):
-        self.training_trace = training_trace
-        self.waiting_time_threshold_sec = waiting_time_threshold_sec
-        self.dataset = dataset
-        self.random_state = 0
-        self.max_features = 'sqrt'
-
-        if self.dataset == 'ANL':
-            self.n_estimators = 250
-            self.min_samples_split = 100
-            self.min_samples_leaf = 250
-        else:
-            self.n_estimators = 100
-            self.min_samples_split = 500
-            self.min_samples_leaf = 100
-
-    """
-    Train waiting time model on training trace given specified waiting time threshold; return model fit on training data
-    """
-
-    def train_waiting_time_model(self):
-        self.training_trace['should_wait_waiting_time_actual'] = self.training_trace['wait_time'] < self.waiting_time_threshold_sec
-
-        X = self.training_trace[['user_id', 'submit_time', 'requested_time', 'requested_CPUs',
-                'num_running_jobs', 'num_waiting_jobs',
-                'running_job_requested_CPUs', 'running_job_requested_CPU_time', 'running_job_mean_CPUs',
-                'running_job_mean_CPU_time', 'running_job_requested_wallclock_limit',
-                'running_job_mean_wallclock_limit',
-                'waiting_job_requested_CPUs', 'waiting_job_requested_CPU_time', 'waiting_job_mean_CPUs',
-                'waiting_job_mean_CPU_time', 'waiting_job_requested_wallclock_limit',
-                'waiting_job_mean_wallclock_limit',
-                'elapsed_runtime_total', 'elapsed_runtime_mean', 'elapsed_waiting_time_total',
-                'elapsed_waiting_time_mean']]
-        y = self.training_trace['should_wait_waiting_time_actual']
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=TEST_SIZE, shuffle=False)
-
-        clf = GradientBoostingClassifier(n_estimators=self.n_estimators, random_state=self.random_state,
-                                         max_features=self.max_features, min_samples_leaf=self.min_samples_leaf,
-                                         min_samples_split=self.min_samples_split)
-
-        clf.fit(X_train, y_train.values.ravel())
-        return clf
-
-## Helper functions
-
-def division_helper(numerator: int, denominator: int) -> float:
-    return numerator / denominator if denominator else 0
-
-def get_job_attributes(job):
-    job_id, time, cpu_alloc, runtime = job.job_id, job.submit_time, job.allocated_CPUs, job.runtime
-    return job_id, time, cpu_alloc, runtime
-
-def is_long_job(job, runtime_threshold) -> bool:
-    return job['should_wait_runtime_predicted_' + str(runtime_threshold)]
 
 """
 Class definition for simulator
@@ -127,9 +39,11 @@ training_trace: Dataframe; trace used to train waiting time model
 
 next_jobID: int; jobID of next job arrival
 current_reserve_jobs: SortedList(tuple); tuple - (finishtime, jobID, nodeID)
-job_schedule_map: Dictionary; key - jobID, value - 'R' or 'D'
 wait_time_map: Dictionary; key - jobID, value - int
 wait_queue: deque; waiting queue
+
+mean_waiting_time_minutes: average waiting time of jobs observed in simulator
+
 """
 
 
@@ -152,13 +66,11 @@ class Simulator:
 
         self.next_jobID: int = 0
         self.current_reserve_jobs: SortedList = SortedList()
-        self.job_schedule_map: Dict[int, str] = {}
         self.wait_time_map: Dict[int, int] = {}
         self.CPU_wait_time_map: Dict[int, int] = {}
         self.wait_queue: deque = deque()
 
         self.mean_waiting_time_minutes: float
-        self.CPU_waiting_time_hours: float
         self.reserved_cost: float
         self.on_demand_cost: float
 
@@ -170,232 +82,6 @@ class Simulator:
             self._reserve_nodes.append(n)
 
     """
-    Determine which fixed nodes to schedule jobs on
-    If sufficient fixed nodes are unavailable, return an empty dict (must queue or run on on-demand)
-    Otherwise, return dict indicating how many CPUs to reserve on which nodes 
-    """
-
-    def _can_schedule(self, cpu_req: int) -> Optional[dict]:
-        node_dic = {}
-        for node in self._reserve_nodes:
-            cpus_scheduled = min(cpu_req, node.idle_cpu)
-            if cpus_scheduled:
-                node_dic[node._nodeID] = cpus_scheduled
-                cpu_req -= cpus_scheduled
-
-        return node_dic if cpu_req == 0 else None
-
-    """
-    Reserve specified CPUs on specified nodes for a given job
-    Add given job to set of currently running jobs
-    """
-
-    def _schedule(
-            self,
-            schedule_dict: dict,
-            start_time: int,
-            runtime_sec: int,
-            job_id: int,
-    ) -> None:
-        for node_id, CPU_count in schedule_dict.items():
-            self._reserve_nodes[node_id].schedule_job(CPU_count, job_id)
-        finish_time = start_time + runtime_sec
-        self.current_reserve_jobs.add((finish_time, start_time, job_id, schedule_dict.keys()))
-
-    """
-    Returns the next event
-    """
-
-    def _get_next_event(self) -> Optional[Event]:
-        next_arr: pd.Series = None
-        next_dep: pd.Series = None
-        next_arr_time = float('inf')
-        next_dep_time = float('inf')
-
-        # Next Arrival
-        if self.next_jobID < self.job_count:
-            next_arr = self.input_trace.loc[self.input_trace['job_id'] == self.next_jobID].iloc[0]
-            next_arr_time = next_arr.submit_time
-
-        # Next Departure
-        if self.current_reserve_jobs:
-            next_dep_time, _, dep_job_id, _ = self.current_reserve_jobs[0]
-            next_dep = self.input_trace.loc[self.input_trace['job_id'] == dep_job_id].iloc[0]
-
-        # All the events are played (0, 0)
-        if next_arr is None and next_dep is None:
-            return None
-
-        # Compare time events
-        if next_dep_time <= next_arr_time:
-            next_event = Event(etype.finish, next_dep_time, next_dep.job_id)
-            # Add back the capacity
-            _, _, _, node_ids = self.current_reserve_jobs.pop(0)
-            for node_id in node_ids:
-                self._reserve_nodes[node_id].remove_job(next_dep.job_id)
-        else:
-            next_event = Event(etype.schedule, next_arr_time, next_arr.job_id)
-            self.next_jobID += 1
-
-        return next_event
-
-    def is_short_wait(self, model, cur_job) -> bool:
-        X_test = self.calc_system_state_features(cur_job)
-        return model.predict(X_test)
-
-    def queue_is_empty(self) -> bool:
-        return not self.wait_queue
-
-    def set_waiting_time(self, job, waiting_time):
-        self.wait_time_map[job.job_id] = waiting_time
-        self.CPU_wait_time_map[job.job_id] = waiting_time * job.allocated_CPUs
-
-    def calc_on_demand_cost_for_job(self, job, runtime):
-        CPUs_needed = self.VM_CPU * math.ceil(job.allocated_CPUs / self.VM_CPU)
-        return CPUs_needed * (runtime / SECONDS_IN_HOUR) * UNIT_CPU_COST_HR
-
-    """
-    Calculates approximate cost of running fixed cluster for trace duration
-    """
-    def _compute_fixed_cost(self) -> float:
-        self.input_trace['submit_time'] = pd.to_numeric(self.input_trace['submit_time'])
-        self.input_trace['end_time'] = pd.to_numeric(self.input_trace['end_time'])
-
-        start_time = self.input_trace.loc[self.input_trace['submit_time'].idxmin()].submit_time
-        end_time = self.input_trace.loc[self.input_trace['end_time'].idxmax()].end_time
-        hours_in_operation = (end_time - start_time) / SECONDS_IN_HOUR
-        return hours_in_operation * UNIT_CPU_COST_HR * self.NUM_VMS * self.VM_CPU * (1 - RESERVE_DISCOUNT)
-
-    def calc_waiting_time_and_reserved_cost(self):
-        self.input_trace["wait_time_sec"] = (self.input_trace["job_id"].map(self.wait_time_map))
-        self.input_trace["CPU_wait_time_sec"] = (self.input_trace["job_id"].map(self.CPU_wait_time_map))
-
-        self.mean_waiting_time_minutes = self.input_trace.wait_time_sec.mean() / SECONDS_IN_MINUTE
-        self.CPU_waiting_time_hours = self.input_trace.CPU_wait_time_sec.sum() / SECONDS_IN_HOUR
-        self.reserved_cost = self._compute_fixed_cost()
-
-    """
-    Check for finished jobs on reserved nodes given current time.
-    Add the back the resources to the respective nodes.
-    """
-
-    def _check_expired_jobs(self, current_time: int) -> None:
-        while self.current_reserve_jobs:
-            finish_time, _, job_id, node_ids = self.current_reserve_jobs[0]
-            if finish_time <= current_time:
-                for node_id in node_ids:
-                    # Remove the job from the node
-                    self._reserve_nodes[node_id].remove_job(job_id)
-                # Pop the job from the running job list
-                self.current_reserve_jobs.pop(0)
-            else:
-                return
-
-
-    def resubmit_long_jobs_after_spec_execution(self, job, runtime_threshold_sec):
-        # Resubmit job after running for "runtime_threshold_sec" time per speculative execution
-        job.loc['speculative_execution'] = True
-        job.loc['submit_time'] = job['submit_time'] + runtime_threshold_sec
-
-        # Place job in correct place in trace
-        temp_df = self.input_trace[self.input_trace['submit_time'] > job.submit_time]
-        new_index = temp_df.iloc[0].job_id
-        job.loc['job_id'] = new_index
-
-        job = job.to_frame().T
-
-        # Reorder and re-index input trace to reflect new timing of job
-        self.input_trace = pd.concat([self.input_trace.iloc[:new_index], job,
-                                      self.input_trace.iloc[new_index:]]).reset_index(drop=True)
-        self.input_trace['job_id'] = self.input_trace.index
-        self.job_count = self.input_trace.job_id.count()
-
-    def print_results(self) -> None:
-        print(
-            "Reserved cost is ",
-            self.reserved_cost,
-            ", On demand cost is ",
-            self.on_demand_cost,
-            ", Mean waiting time is ",
-            self.mean_waiting_time_minutes, " minutes",
-            ", Total CPU waiting time is ",
-            self.CPU_waiting_time_hours, " hours"
-        )
-
-    """
-    Calculate system state upon submission of a job in order to predict waiting time
-    """
-    def calc_system_state_features(self, waiting_job):
-        starting_times = [job[1] for job in self.current_reserve_jobs]
-
-        running_job_ids = [job[2] for job in self.current_reserve_jobs]
-        running_jobs = self.input_trace.loc[self.input_trace['job_id'].isin(running_job_ids)].index
-        waiting_jobs = self.input_trace.loc[self.input_trace['job_id'].isin(self.wait_queue)].index
-
-        user_id = waiting_job.user_id
-        submit_time = waiting_job.submit_time
-        requested_time = waiting_job.requested_time
-        requested_CPUs = waiting_job.requested_CPUs
-        elapsed_runtimes = [submit_time - start_time for start_time in starting_times]
-
-        num_running_jobs = len(self.current_reserve_jobs)
-        num_waiting_jobs = len(self.wait_queue)
-
-        running_job_total_requested_CPUs = self.input_trace.loc[running_jobs, 'requested_CPUs'].sum()
-        running_job_mean_requested_CPUs = division_helper(running_job_total_requested_CPUs, num_running_jobs)
-
-        running_job_total_requested_CPU_time = self.input_trace.loc[running_jobs, 'CPU_time'].sum()
-        running_job_mean_requested_CPU_time = division_helper(running_job_total_requested_CPU_time,
-                                                              num_running_jobs)
-
-        running_job_total_requested_wallclock_time = self.input_trace.loc[running_jobs, 'requested_time'].sum()
-        running_job_mean_requested_wallclock_time = division_helper(running_job_total_requested_wallclock_time,
-                                                                    num_running_jobs)
-
-        waiting_job_total_requested_CPUs = self.input_trace.loc[waiting_jobs, 'requested_CPUs'].sum()
-        waiting_job_mean_requested_CPUs = division_helper(waiting_job_total_requested_CPUs, num_waiting_jobs)
-
-        waiting_job_total_requested_CPU_time = self.input_trace.loc[waiting_jobs, 'CPU_time'].sum()
-        waiting_job_mean_requested_CPU_time = division_helper(waiting_job_total_requested_CPU_time,
-                                                              num_waiting_jobs)
-
-        waiting_job_total_requested_wallclock_time = self.input_trace.loc[waiting_jobs, 'requested_time'].sum()
-        waiting_job_mean_requested_wallclock_time = division_helper(waiting_job_total_requested_wallclock_time,
-                                                                    num_waiting_jobs)
-
-        elapsed_runtime_total = sum(elapsed_runtimes)
-        elapsed_runtime_mean = division_helper(elapsed_runtime_total, num_running_jobs)
-
-        elapsed_waiting_time_total = (submit_time - self.input_trace.loc[waiting_jobs, 'submit_time']).sum()
-        elapsed_waiting_time_mean = division_helper(elapsed_waiting_time_total, num_waiting_jobs)
-
-        data = np.array([(user_id, submit_time, requested_time, requested_CPUs,
-                          num_running_jobs, num_waiting_jobs,
-                          running_job_total_requested_CPUs, running_job_total_requested_CPU_time,
-                          running_job_mean_requested_CPUs, running_job_mean_requested_CPU_time,
-                          running_job_total_requested_wallclock_time, running_job_mean_requested_wallclock_time,
-                          waiting_job_total_requested_CPUs, waiting_job_total_requested_CPU_time,
-                          waiting_job_mean_requested_CPUs, waiting_job_mean_requested_CPU_time,
-                          waiting_job_total_requested_wallclock_time, waiting_job_mean_requested_wallclock_time,
-                          elapsed_runtime_total, elapsed_runtime_mean,
-                          elapsed_waiting_time_total, elapsed_waiting_time_mean)])
-
-        X_test = pd.DataFrame(data, columns=['user_id', 'submit_time', 'requested_time', 'requested_CPUs',
-                                             'num_running_jobs', 'num_waiting_jobs',
-                                             'running_job_requested_CPUs', 'running_job_requested_CPU_time',
-                                             'running_job_mean_CPUs',
-                                             'running_job_mean_CPU_time', 'running_job_requested_wallclock_limit',
-                                             'running_job_mean_wallclock_limit',
-                                             'waiting_job_requested_CPUs', 'waiting_job_requested_CPU_time',
-                                             'waiting_job_mean_CPUs',
-                                             'waiting_job_mean_CPU_time', 'waiting_job_requested_wallclock_limit',
-                                             'waiting_job_mean_wallclock_limit',
-                                             'elapsed_runtime_total', 'elapsed_runtime_mean',
-                                             'elapsed_waiting_time_total',
-                                             'elapsed_waiting_time_mean'])
-        return X_test
-
-    """
         Run the simulator using our custom approach
         *Implements LJW using ML models and a modified form of speculative execution 
         *Implements SWW based on waiting time models
@@ -404,6 +90,7 @@ class Simulator:
         *All other jobs run on on-demand resources for up to "runtime threshold_min" time. Jobs that are still running
         after this time are killed and resubmitted to queue for fixed resources
     """
+
     def run_custom_approach(
             self,
             runtime_threshold_min: int,
@@ -643,47 +330,262 @@ class Simulator:
         self.on_demand_cost = 0
         self.print_results()
 
-def get_results(simulator, dataset, runtime_threshold, waiting_time_threshold, technique) -> None:
-    match technique:
-        case 'custom':
-            print("Running custom approach on " + dataset + " with runtime threshold of " + str(runtime_threshold) +
-                  " minutes and waiting time threshold of " + str(waiting_time_threshold) + " hour(s)")
-            simulator.run_custom_approach(runtime_threshold_min=runtime_threshold,
-                                          waiting_time_threshold_hour=waiting_time_threshold)
-        case 'original':
-            print("Running original approach on " + dataset + " with runtime threshold of " + str(runtime_threshold) +
-                  " minutes and waiting time threshold of " + str(waiting_time_threshold) + " hour(s)")
-            simulator.run_original(runtime_threshold_min=runtime_threshold,
-                                   waiting_time_threshold_hour=waiting_time_threshold)
-        case 'AJW':
-            print("Running AJW on " + dataset)
-            simulator.run_AJW()
-        case 'NJW':
-            print("Running NJW on " + dataset)
-            simulator.run_NJW()
+    """
+    Determine which fixed nodes to schedule jobs on
+    If sufficient fixed nodes are unavailable, return an empty dict (must queue or run on on-demand)
+    Otherwise, return dict indicating how many CPUs to reserve on which nodes 
+    """
 
-if __name__ == "__main__":
-    dataset = sys.argv[1]
-    technique = sys.argv[2]
+    def _can_schedule(self, cpu_req: int) -> Optional[dict]:
+        node_dic = {}
+        for node in self._reserve_nodes:
+            cpus_scheduled = min(cpu_req, node.idle_cpu)
+            if cpus_scheduled:
+                node_dic[node._nodeID] = cpus_scheduled
+                cpu_req -= cpus_scheduled
 
-    if dataset == 'ANL':
-        input_trace = pd.read_csv(os.path.abspath('../Dataset/ANL_trace_output_FINAL.csv'))\
-            .sort_values(by=['submit_time'])
-        training_trace = pd.read_csv(os.path.abspath('../Dataset/cleaned_ANL_with_waiting_times_full.csv'))
-        num_VMs = 40960
-        vm_CPU = 4
-    elif dataset == 'RICC':
-        input_trace = pd.read_csv(os.path.abspath('../Dataset/RICC_trace_output_FINAL.csv'))\
-            .sort_values(by=['submit_time'])
-        training_trace = pd.read_csv(os.path.abspath('../Dataset/cleaned_RICC_with_waiting_times_full.csv'))
-        num_VMs = 1024
-        vm_CPU = 8
-    else:
-        exit(1)
+        return node_dic if cpu_req == 0 else None
 
-    simulator = Simulator(dataset=dataset, NUM_VMS=num_VMs, VM_CPU=vm_CPU, input_trace=input_trace, training_trace=training_trace)
-    for runtime_threshold in RUNTIME_THRESHOLD_VALUES:
-        for waiting_time_threshold in WAITING_TIME_THRESHOLD_VALUES:
-           simulator = Simulator(dataset=dataset, NUM_VMS=num_VMs, VM_CPU=vm_CPU, input_trace=input_trace,
-                                  training_trace=training_trace)
-           get_results(simulator, dataset, runtime_threshold, waiting_time_threshold, technique)
+    """
+    Reserve specified CPUs on specified nodes for a given job
+    Add given job to set of currently running jobs
+    """
+
+    def _schedule(
+            self,
+            schedule_dict: dict,
+            start_time: int,
+            runtime_sec: int,
+            job_id: int,
+    ) -> None:
+        for node_id, CPU_count in schedule_dict.items():
+            self._reserve_nodes[node_id].schedule_job(CPU_count, job_id)
+        finish_time = start_time + runtime_sec
+        self.current_reserve_jobs.add((finish_time, start_time, job_id, schedule_dict.keys()))
+
+    """
+    Returns the next event
+    """
+
+    def _get_next_event(self) -> Optional[Event]:
+        next_arr: pd.Series = None
+        next_dep: pd.Series = None
+        next_arr_time = float('inf')
+        next_dep_time = float('inf')
+
+        # Next Arrival
+        if self.next_jobID < self.job_count:
+            next_arr = self.input_trace.loc[self.input_trace['job_id'] == self.next_jobID].iloc[0]
+            next_arr_time = next_arr.submit_time
+
+        # Next Departure
+        if self.current_reserve_jobs:
+            next_dep_time, _, dep_job_id, _ = self.current_reserve_jobs[0]
+            next_dep = self.input_trace.loc[self.input_trace['job_id'] == dep_job_id].iloc[0]
+
+        # All the events are played (0, 0)
+        if next_arr is None and next_dep is None:
+            return None
+
+        # Compare time events
+        if next_dep_time <= next_arr_time:
+            next_event = Event(etype.finish, next_dep_time, next_dep.job_id)
+            # Add back the capacity
+            _, _, _, node_ids = self.current_reserve_jobs.pop(0)
+            for node_id in node_ids:
+                self._reserve_nodes[node_id].remove_job(next_dep.job_id)
+        else:
+            next_event = Event(etype.schedule, next_arr_time, next_arr.job_id)
+            self.next_jobID += 1
+
+        return next_event
+
+    """
+    Calculates approximate cost of running fixed cluster for trace duration
+    """
+
+    def _compute_fixed_cost(self) -> float:
+        self.input_trace['submit_time'] = pd.to_numeric(self.input_trace['submit_time'])
+        self.input_trace['end_time'] = pd.to_numeric(self.input_trace['end_time'])
+
+        start_time = self.input_trace.loc[self.input_trace['submit_time'].idxmin()].submit_time
+        end_time = self.input_trace.loc[self.input_trace['end_time'].idxmax()].end_time
+        hours_in_operation = (end_time - start_time) / SECONDS_IN_HOUR
+        return hours_in_operation * UNIT_CPU_COST_HR * self.NUM_VMS * self.VM_CPU * (1 - RESERVE_DISCOUNT)
+
+    """
+    Check for finished jobs on reserved nodes given current time.
+    Add the back the resources to the respective nodes.
+    """
+
+    def _check_expired_jobs(self, current_time: int) -> None:
+        while self.current_reserve_jobs:
+            finish_time, _, job_id, node_ids = self.current_reserve_jobs[0]
+            if finish_time <= current_time:
+                for node_id in node_ids:
+                    # Remove the job from the node
+                    self._reserve_nodes[node_id].remove_job(job_id)
+                # Pop the job from the running job list
+                self.current_reserve_jobs.pop(0)
+            else:
+                return
+
+    def resubmit_long_jobs_after_spec_execution(self, job, runtime_threshold_sec):
+        # Resubmit job after running for "runtime_threshold_sec" time per speculative execution
+        job.loc['speculative_execution'] = True
+        job.loc['submit_time'] = job['submit_time'] + runtime_threshold_sec
+
+        # Place job in correct place in trace
+        temp_df = self.input_trace[self.input_trace['submit_time'] > job.submit_time]
+        new_index = temp_df.iloc[0].job_id
+        job.loc['job_id'] = new_index
+
+        job = job.to_frame().T
+
+        # Reorder and re-index input trace to reflect new timing of job
+        self.input_trace = pd.concat([self.input_trace.iloc[:new_index], job,
+                                      self.input_trace.iloc[new_index:]]).reset_index(drop=True)
+        self.input_trace['job_id'] = self.input_trace.index
+        self.job_count = self.input_trace.job_id.count()
+
+    """
+    Determines whether job has short expected wait to implement SWW
+    """
+
+    def is_short_wait(self, model, cur_job) -> bool:
+        X_test = self.calc_system_state_features(cur_job)
+        return model.predict(X_test)
+
+    """
+    Determines whether fixed resource waiting queue is empty
+    """
+
+    def queue_is_empty(self) -> bool:
+        return not self.wait_queue
+
+    """
+    Records observed waiting time for a job
+    """
+
+    def set_waiting_time(self, job, waiting_time):
+        self.wait_time_map[job.job_id] = waiting_time
+        self.CPU_wait_time_map[job.job_id] = waiting_time * job.allocated_CPUs
+
+    """
+    Calculates cost of running job on on-demand resources based on runtime and CPU allocation
+    """
+
+    def calc_on_demand_cost_for_job(self, job, runtime):
+        CPUs_needed = self.VM_CPU * math.ceil(job.allocated_CPUs / self.VM_CPU)
+        return CPUs_needed * (runtime / SECONDS_IN_HOUR) * UNIT_CPU_COST_HR
+
+    """
+    Computes observed mean waiting time and reserved / fixed resource cost metrics for output
+    """
+
+    def calc_waiting_time_and_reserved_cost(self):
+        self.input_trace["wait_time_sec"] = (self.input_trace["job_id"].map(self.wait_time_map))
+        self.mean_waiting_time_minutes = self.input_trace.wait_time_sec.mean() / SECONDS_IN_MINUTE
+        self.reserved_cost = self._compute_fixed_cost()
+
+    """
+    Calculate system state features upon submission of a job. These features are used to train the waiting time model
+    """
+
+    def calc_system_state_features(self, waiting_job):
+        starting_times = [job[1] for job in self.current_reserve_jobs]
+
+        running_job_ids = [job[2] for job in self.current_reserve_jobs]
+        running_jobs = self.input_trace.loc[self.input_trace['job_id'].isin(running_job_ids)].index
+        waiting_jobs = self.input_trace.loc[self.input_trace['job_id'].isin(self.wait_queue)].index
+
+        user_id = waiting_job.user_id
+        submit_time = waiting_job.submit_time
+        requested_time = waiting_job.requested_time
+        requested_CPUs = waiting_job.requested_CPUs
+        elapsed_runtimes = [submit_time - start_time for start_time in starting_times]
+
+        num_running_jobs = len(self.current_reserve_jobs)
+        num_waiting_jobs = len(self.wait_queue)
+
+        running_job_total_requested_CPUs = self.input_trace.loc[running_jobs, 'requested_CPUs'].sum()
+        running_job_mean_requested_CPUs = division_helper(running_job_total_requested_CPUs, num_running_jobs)
+
+        running_job_total_requested_CPU_time = self.input_trace.loc[running_jobs, 'CPU_time'].sum()
+        running_job_mean_requested_CPU_time = division_helper(running_job_total_requested_CPU_time,
+                                                              num_running_jobs)
+
+        running_job_total_requested_wallclock_time = self.input_trace.loc[running_jobs, 'requested_time'].sum()
+        running_job_mean_requested_wallclock_time = division_helper(running_job_total_requested_wallclock_time,
+                                                                    num_running_jobs)
+
+        waiting_job_total_requested_CPUs = self.input_trace.loc[waiting_jobs, 'requested_CPUs'].sum()
+        waiting_job_mean_requested_CPUs = division_helper(waiting_job_total_requested_CPUs, num_waiting_jobs)
+
+        waiting_job_total_requested_CPU_time = self.input_trace.loc[waiting_jobs, 'CPU_time'].sum()
+        waiting_job_mean_requested_CPU_time = division_helper(waiting_job_total_requested_CPU_time,
+                                                              num_waiting_jobs)
+
+        waiting_job_total_requested_wallclock_time = self.input_trace.loc[waiting_jobs, 'requested_time'].sum()
+        waiting_job_mean_requested_wallclock_time = division_helper(waiting_job_total_requested_wallclock_time,
+                                                                    num_waiting_jobs)
+
+        elapsed_runtime_total = sum(elapsed_runtimes)
+        elapsed_runtime_mean = division_helper(elapsed_runtime_total, num_running_jobs)
+
+        elapsed_waiting_time_total = (submit_time - self.input_trace.loc[waiting_jobs, 'submit_time']).sum()
+        elapsed_waiting_time_mean = division_helper(elapsed_waiting_time_total, num_waiting_jobs)
+
+        data = np.array([(user_id, submit_time, requested_time, requested_CPUs,
+                          num_running_jobs, num_waiting_jobs,
+                          running_job_total_requested_CPUs, running_job_total_requested_CPU_time,
+                          running_job_mean_requested_CPUs, running_job_mean_requested_CPU_time,
+                          running_job_total_requested_wallclock_time, running_job_mean_requested_wallclock_time,
+                          waiting_job_total_requested_CPUs, waiting_job_total_requested_CPU_time,
+                          waiting_job_mean_requested_CPUs, waiting_job_mean_requested_CPU_time,
+                          waiting_job_total_requested_wallclock_time, waiting_job_mean_requested_wallclock_time,
+                          elapsed_runtime_total, elapsed_runtime_mean,
+                          elapsed_waiting_time_total, elapsed_waiting_time_mean)])
+
+        X_test = pd.DataFrame(data, columns=['user_id', 'submit_time', 'requested_time', 'requested_CPUs',
+                                             'num_running_jobs', 'num_waiting_jobs',
+                                             'running_job_requested_CPUs', 'running_job_requested_CPU_time',
+                                             'running_job_mean_CPUs',
+                                             'running_job_mean_CPU_time', 'running_job_requested_wallclock_limit',
+                                             'running_job_mean_wallclock_limit',
+                                             'waiting_job_requested_CPUs', 'waiting_job_requested_CPU_time',
+                                             'waiting_job_mean_CPUs',
+                                             'waiting_job_mean_CPU_time', 'waiting_job_requested_wallclock_limit',
+                                             'waiting_job_mean_wallclock_limit',
+                                             'elapsed_runtime_total', 'elapsed_runtime_mean',
+                                             'elapsed_waiting_time_total',
+                                             'elapsed_waiting_time_mean'])
+        return X_test
+
+    """
+    Outputs results of running simulator
+    
+    """
+    def print_results(self) -> None:
+        print(
+            "Reserved cost is ",
+            self.reserved_cost,
+            ", On demand cost is ",
+            self.on_demand_cost,
+            ", Mean waiting time is ",
+            self.mean_waiting_time_minutes, " minutes"
+        )
+
+## Helper functions
+
+def division_helper(numerator: int, denominator: int) -> float:
+    return numerator / denominator if denominator else 0
+
+
+def get_job_attributes(job):
+    job_id, time, cpu_alloc, runtime = job.job_id, job.submit_time, job.allocated_CPUs, job.runtime
+    return job_id, time, cpu_alloc, runtime
+
+
+def is_long_job(job, runtime_threshold) -> bool:
+    return job['should_wait_runtime_predicted_' + str(runtime_threshold)]
