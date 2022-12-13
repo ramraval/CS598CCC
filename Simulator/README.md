@@ -6,6 +6,8 @@ Per the Sustainable Computing Lab, the simulator can be described as follows: "W
 
 We use this simulator to compare the implied cost and mean waiting time of our custom waiting policy implementation versus a traditional implementation. 
 
-## To run the simulator (simulator.py)
+## To run the simulator (run_simulator.py)
 
 Specify the dataset ('ANL' or 'RICC') and the approach ('custom', 'original', 'NJW', 'AJW')
+
+Note the input training trace for RICC has not been uploaded to the GitHub repository due to size limitations
